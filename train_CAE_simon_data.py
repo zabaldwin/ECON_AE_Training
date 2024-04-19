@@ -2,7 +2,8 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
+from keras import layers
+from keras.layers import Layer
 from qkeras import QActivation,QConv2D,QDense,quantized_bits
 import qkeras
 from qkeras.utils import model_save_quantized_weights
@@ -162,6 +163,12 @@ def mean_mse_loss(y_true, y_pred):
     mean_mse_loss = tf.reduce_mean(weighted_mse_per_row)
     return mean_mse_loss
 
+def resample_indices(indices, energy, bin_edges, target_count, bin_index):
+    bin_indices = indices[(energy > bin_edges[bin_index]) & (energy <= bin_edges[bin_index+1])]
+    if len(bin_indices) > target_count:
+        return np.random.choice(bin_indices, size=target_count, replace=False)
+    else:
+        return np.random.choice(bin_indices, size=target_count, replace=True)
 
 def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
     from files import get_rootfiles
@@ -282,29 +289,66 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
             sumCALQ = sumCALQ[mask]
 
         elif args.biased:
-            mask = (wafer_sim_energy > 0) 
-            indices_passing = np.where(mask)[0]
-            indices_not_passing = np.where(~mask)[0]
-            
-            if args.b_percent is not None:
-                k = args.b_percent /(1-args.b_percent)
-            else: 
-                k = 3
-            desired_not_passing_count = int(len(indices_passing) / k) 
-            selected_not_passing_indices = np.random.choice(indices_not_passing, size=desired_not_passing_count, replace=False)
+            # New: Resampling based
+            filtered_energy = wafer_sim_energy[wafer_sim_energy > 1]
 
-            new_mask_indices = np.concatenate((indices_passing, selected_not_passing_indices))
-            mask = np.zeros_like(wafer_sim_energy, dtype=bool)
-            mask[new_mask_indices] = True
+            # Number of samples for demonstration
+            num_samples = len(filtered_energy)  # Ensure this matches with your actual data
+
+            # Create a list of indices representing each sample
+            indices = np.arange(num_samples)
+
+            # Define bin edges based on energy
+            bin_edges = np.histogram_bin_edges(filtered_energy, bins=3)
+
+            # Function to resample indices for each bin
+            
+
+            # Target sample count for each bin
+            target_sample_count = 1000
+
+            # Resample indices for each bin
+            resampled_indices = np.array([], dtype=int)
+
+            for i in range(len(bin_edges)-1):
+                resampled_bin_indices = resample_indices(indices, filtered_energy, bin_edges, target_sample_count, i)
+                resampled_indices = np.concatenate([resampled_indices, resampled_bin_indices])
+            n_pileup = int(3000 * (1/args.b_percent - 1))
+            resampled_indices = np.concatenate([resampled_indices,np.random.choice(np.where(wafer_sim_energy < 1)[0],n_pileup)])
+
+            # Now use resampled_indices to select samples from each feature array
+            inputs = inputs[resampled_indices]
+            l = layers[resampled_indices]
+            eta = eta[resampled_indices]
+            waferv = waferv[resampled_indices]
+            waferu = waferu[resampled_indices]
+            wafertype = wafertype[resampled_indices]
+            sumCALQ = sumCALQ[resampled_indices]
+            
+            # Old: Cut based
+#             mask = (wafer_sim_energy > 0) 
+#             indices_passing = np.where(mask)[0]
+#             indices_not_passing = np.where(~mask)[0]
+            
+#             if args.b_percent is not None:
+#                 k = args.b_percent /(1-args.b_percent)
+#             else: 
+#                 k = 3
+#             desired_not_passing_count = int(len(indices_passing) / k) 
+#             selected_not_passing_indices = np.random.choice(indices_not_passing, size=desired_not_passing_count, replace=False)
+
+#             new_mask_indices = np.concatenate((indices_passing, selected_not_passing_indices))
+#             mask = np.zeros_like(wafer_sim_energy, dtype=bool)
+#             mask[new_mask_indices] = True
          
 
-            inputs = inputs[mask]
-            l =l[mask]
-            eta = eta[mask]
-            waferv = waferv[mask]
-            waferu = waferu[mask]
-            wafertype = wafertype[mask]
-            sumCALQ = sumCALQ[mask]
+#             inputs = inputs[mask]
+#             l =l[mask]
+#             eta = eta[mask]
+#             waferv = waferv[mask]
+#             waferu = waferu[mask]
+#             wafertype = wafertype[mask]
+#             sumCALQ = sumCALQ[mask]
         data_list.append([inputs,eta,waferv,waferu,wafertype,sumCALQ,l])
 
 
@@ -360,6 +404,27 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
 
     return train_loader, test_loader
     
+class keras_pad(Layer):
+    def call(self, x):
+        padding = tf.constant([[0,0],[0, 1], [0, 1], [0, 0]])
+        return tf.pad(
+        x, padding, mode='CONSTANT', constant_values=0, name=None
+    )
+    
+    
+class keras_minimum(Layer):
+    def call(self, x, sat_val = 1):
+        return tf.minimum(x,sat_val)
+    
+    
+class keras_floor(Layer):
+    def call(self, x):
+        if isinstance(x, tf.SparseTensor):
+            x = tf.sparse.to_dense(x)
+            
+        return tf.math.floor(x)
+      
+    
     
     
 args = p.parse_args()
@@ -400,7 +465,7 @@ for eLinks in [2,3,4,5]:
     dense_biasBits  = 6 
     encodedBits = 9
     CNN_kernel_size = 3
-    padding = tf.constant([[0,0],[0, 1], [0, 1], [0, 0]])
+    
 
 
     input_enc = Input(batch_shape=(batch,8,8, 1), name = 'Wafer')
@@ -411,16 +476,17 @@ for eLinks in [2,3,4,5]:
 
     # Quantizing input, 8 bit quantization, 1 bit for integer
     x = QActivation(quantized_bits(bits = 8, integer = 1),name = 'input_quantization')(input_enc)
-    x = tf.pad(
-        x, padding, mode='CONSTANT', constant_values=0, name=None
-    )
+    x = keras_pad()(x)
+#     x = tf.pad(
+#         x, padding, mode='CONSTANT', constant_values=0, name=None
+#     )
     x = QConv2D(n_kernels,
                 CNN_kernel_size, 
                 strides=2,padding = 'valid', kernel_quantizer=quantized_bits(bits=conv_weightBits,integer=0,keep_negative=1,alpha=1), bias_quantizer=quantized_bits(bits=conv_biasBits,integer=0,keep_negative=1,alpha=1),
                 name="conv2d")(x)
-
+    
     x = QActivation(quantized_bits(bits = 8, integer = 1),name = 'act')(x)
-
+    
 
     x = Flatten()(x)
 
@@ -433,7 +499,9 @@ for eLinks in [2,3,4,5]:
     x = QActivation(qkeras.quantized_bits(bits = 9, integer = 1),name = 'latent_quantization')(x)
     latent = x
     if bitsPerOutput > 0 and maxBitsPerOutput > 0:
-        latent = tf.minimum(tf.math.floor(latent *  outputMaxIntSize) /  outputMaxIntSize, outputSaturationValue)
+        latent = keras_floor()(latent *  outputMaxIntSize)
+        latent = keras_minimum()(latent/outputMaxIntSize, sat_val = outputSaturationValue)
+#         latent = tf.minimum(tf.math.floor(latent *  outputMaxIntSize) /  outputMaxIntSize, outputSaturationValue)
 
     latent = concatenate([latent,cond],axis=1)
    
@@ -540,8 +608,9 @@ for eLinks in [2,3,4,5]:
 
         total_loss_train = total_loss_train#/(len(train_loader))
         total_loss_val = total_loss_val#/(len(test_loader))
-        print('Epoch {:03d}, Loss: {:.8f}, ValLoss: {:.8f}'.format(
-            epoch, total_loss_train,  total_loss_val))
+        if epoch % 25 == 0:
+            print('Epoch {:03d}, Loss: {:.8f}, ValLoss: {:.8f}'.format(
+                epoch, total_loss_train,  total_loss_val))
 
 
 
@@ -563,7 +632,8 @@ for eLinks in [2,3,4,5]:
         plt.savefig(plot_path)
 
         if total_loss_val < best_val_loss:
-            print('New Best Model')
+            if epoch % 25 == 0:
+                print('New Best Model')
             best_val_loss = total_loss_val
             cae.save_weights(os.path.join(model_dir, 'best-epoch.tf'.format(epoch)))
             encoder.save_weights(os.path.join(model_dir, 'best-encoder-epoch.tf'.format(epoch)))

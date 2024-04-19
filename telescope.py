@@ -30,7 +30,6 @@ while for a SC shifted one TC to the right the weight is 2*1/4+2*1/2=1.5
 """
 
 import tensorflow as tf
-import torch
 import numpy as np
 from tensorflow.keras import backend as K
 
