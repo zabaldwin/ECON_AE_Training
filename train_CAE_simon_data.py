@@ -76,7 +76,7 @@ p.add_args(
     ('--opath', p.STR),
     ('--mpath', p.STR),('--prepath', p.STR),('--continue_training', p.STORE_TRUE), ('--batchsize', p.INT),
     ('--lr', {'type': float}),
-    ('--num_files', p.INT),('--optim', p.STR),('--eLinks', p.INT),('--biased', p.STORE_TRUE), ('--alloc_geom', p.STR)
+    ('--num_files', p.INT),('--optim', p.STR),('--model_per_eLink',  p.STORE_TRUE),('--model_per_bit_config',  p.STORE_TRUE),('--biased', p.STORE_TRUE), ('--alloc_geom', p.STR)
     
     
 )
@@ -198,19 +198,24 @@ def custom_resample(wafers,c,simE):
     return wafers_p, c_p
 
 def get_old_mask(eLinks, df):
-    if eLinks == 5:
-        return (df['layer'] <= 11) & (df['layer'] >= 5)
-    elif eLinks == 4:
-        return (df['layer'] == 7) | (df['layer'] == 11)
-    elif eLinks == 3:
-        return df['layer'] == 13
-    elif eLinks == 2:
-        return (df['layer'] < 7) | (df['layer'] > 13)
-    elif eLinks == -1:
-        return df['layer'] > 0
+    mask = pd.Series([False] * len(df))  # Initialize a mask with all False values
+    
+    for eLink in eLinks:
+        if eLink == 5:
+            mask = mask | ((df['layer'] <= 11) & (df['layer'] >= 5))
+        elif eLink == 4:
+            mask = mask | ((df['layer'] == 7) | (df['layer'] == 11))
+        elif eLink == 3:
+            mask = mask | (df['layer'] == 13)
+        elif eLink == 2:
+            mask = mask | ((df['layer'] < 7) | (df['layer'] > 13))
+        elif eLink == -1:
+            mask = mask | (df['layer'] > 0)
+    
+    return mask
 
     
-def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
+def load_data(nfiles,batchsize,model_info = -1, normalize = True):
     from files import get_rootfiles
     from coffea.nanoevents import NanoEventsFactory
     import awkward as ak
@@ -218,6 +223,10 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
     ecr = np.vectorize(encode)
     data_list = []
     simE_list = []
+    if args.model_per_eLink:
+        eLinks = model_info
+    elif args.model_per_bit_config:
+        bitsPerOutput = model_info
 
     # Paths to Simon's dataset
     hostid = 'cmseos.fnal.gov'
@@ -270,27 +279,29 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
         combined_df = pd.DataFrame(data_dict, index=eta.index)
         calq_columns = [f'CALQ{i}' for i in range(1,64)]
         combined_df['sumCALQ'] = combined_df[calq_columns].sum(axis=1)
-
-        if args.alloc_geom == 'new':
         
-            # Make eLink filter
-            if eLinks < 6:
-                filtered_key_df = key_df[key_df['trigLinks'] < 6]
-            else:
+        if args.alloc_geom == 'new':
+            if args.model_per_eLink:
                 filtered_key_df = key_df[key_df['trigLinks'] == float(eLinks)]
-
-            # Filter based on eLink allocations
-
-            filtered_df = pd.merge(combined_df, filtered_key_df[['u', 'v', 'layer']], on=['u', 'v', 'layer'], how='inner')
-            
+                filtered_df = pd.merge(combined_df, filtered_key_df[['u', 'v', 'layer']], on=['u', 'v', 'layer'], how='inner')
+            elif args.model_per_bit_config:
+                eLinks_with_bit_alloc = [index for index, value in enumerate(bitsPerOutputLink) if value == bitsPerOutput]
+                eLinks_with_bit_alloc = [float(b) for b in eLinks_with_bit_alloc if b < 12]
+                filtered_key_df = key_df[key_df['trigLinks'].isin(eLinks_with_bit_alloc)]
+                filtered_df = pd.merge(combined_df, filtered_key_df[['u', 'v', 'layer']], on=['u', 'v', 'layer'], how='inner')
+        
         elif args.alloc_geom =='old':
-            mask = get_old_mask(eLinks, combined_df)
-            filtered_df = combined_df[mask]
-            
+            if args.model_per_eLink:
+                mask = get_old_mask(eLinks, combined_df)
+                filtered_df = combined_df[mask]
+            elif args.model_per_bit_config:
+                eLinks_with_bit_alloc = [index for index, value in enumerate(bitsPerOutputLink) if value == bitsPerOutput]
+                eLinks_with_bit_alloc = [b for b in eLinks_with_bit_alloc if b < 6]
+                mask = get_old_mask(eLinks_with_bit_alloc, combined_df)
+                filtered_df = combined_df[mask]
             
         print('Size after eLink filtering')
         print(len(filtered_df))
-
         
         # Process the filtered DataFrame
         filtered_df['eta'] = filtered_df['eta'] / 3.1
@@ -378,7 +389,6 @@ def load_data(nfiles,batchsize,eLinks = -1, normalize = True):
     cond_train = concatenated_cond[train_indices]
     cond_test = concatenated_cond[test_indices]
     if args.biased:
-        
         wafer_train,cond_train = custom_resample(wafer_train,cond_train,simE_train)
         print(wafer_train.shape)
         wafer_test,cond_test = custom_resample(wafer_test,cond_test, simE_test)
@@ -427,19 +437,32 @@ if not os.path.exists(model_dir):
     os.system("mkdir -p "+model_dir)
 
 # Loop through each number of eLinks
-if args.alloc_geom == 'old':
-    all_eLinks = [2,3,4,5]
-elif args.alloc_geom =='new':
-    all_eLinks = [1,2,3,4,5,6,7,8,9,10,11]
-    
+
+if args.model_per_eLink:
+    if args.alloc_geom == 'old':
+        all_models = [2,3,4,5]
+    elif args.alloc_geom =='new':
+        all_models = [1,2,3,4,5,6,7,8,9,10,11]
+elif args.model_per_bit_config:
+    all_models = [1,3,5,7,9]
+
+
 bitsPerOutputLink = [0, 1, 3, 5, 7, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]    
-for eLinks in all_eLinks:
+
+for m in all_models:
+    if args.model_per_eLink:
+        eLinks = m
+        bitsPerOutput = bitsPerOutputLink[eLinks]
+        print(f'Training Model with {eLinks} eLinks')
+        model_dir = os.path.join(args.opath, f'model_{eLinks}_eLinks')
+    elif args.model_per_bit_config:
+        bitsPerOutput = m
+        print(f'Training Model with {bitsPerOutput} output bits')
+        model_dir = os.path.join(args.opath, f'model_{bitsPerOutput}_bits')
     
-    print(f'Training Model with {eLinks} eLinks')
-    model_dir = os.path.join(args.opath, f'model_{eLinks}_eLinks')
     if not os.path.exists(model_dir):
         os.system("mkdir -p " + model_dir)
-    bitsPerOutput = bitsPerOutputLink[eLinks]
+    
     nIntegerBits = 1;
     nDecimalBits = bitsPerOutput - nIntegerBits;
     outputSaturationValue = (1 << nIntegerBits) - 1./(1 << nDecimalBits);
@@ -573,7 +596,7 @@ for eLinks in all_eLinks:
 
 
     print('Loading Data')
-    train_loader, test_loader = load_data(args.num_files,batch,eLinks =eLinks)
+    train_loader, test_loader = load_data(args.num_files,batch,model_info =m)
     print('Data Loaded')
 
 
@@ -615,8 +638,8 @@ for eLinks in all_eLinks:
             total_loss_val = total_loss_val+loss
 
 
-        total_loss_train = total_loss_train #/(len(train_loader))
-        total_loss_val = total_loss_val #/(len(test_loader))
+        total_loss_train = total_loss_train /(len(train_loader))
+        total_loss_val = total_loss_val /(len(test_loader))
         if epoch % 25 == 0:
             print('Epoch {:03d}, Loss: {:.8f}, ValLoss: {:.8f}'.format(
                 epoch, total_loss_train,  total_loss_val))
@@ -638,7 +661,6 @@ for eLinks in all_eLinks:
         plot_path = f"{model_dir}/loss_plot.png"
         plt.savefig(plot_path)
         df.to_csv(f"{model_dir}/df.csv", index=False)
-
         
 
         if total_loss_val < best_val_loss:
@@ -649,4 +671,27 @@ for eLinks in all_eLinks:
             encoder.save_weights(os.path.join(model_dir, 'best-encoder-epoch.tf'.format(epoch)))
             decoder.save_weights(os.path.join(model_dir, 'best-decoder-epoch.tf'.format(epoch)))
     save_models(cae,args.mname,isQK = True)
+    
+    
 
+import subprocess
+
+if args.model_per_eLink:
+    args = [
+        'python', 'dev_preCMSSW.py',
+        '--mname', 'vanilla_AE',
+        '--mpath', args.opath,
+        '--model_per_eLink',
+        '--alloc_geom', args.alloc_geom
+        ]
+elif args.model_per_bit_config:
+    args = [
+        'python', 'dev_preCMSSW.py',
+        '--mname', 'vanilla_AE',
+        '--mpath', args.opath,
+        '--model_per_bit_config',
+        '--alloc_geom', args.alloc_geom
+        ]
+
+# Run the other script with the arguments
+subprocess.run(args)
