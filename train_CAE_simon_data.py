@@ -76,8 +76,8 @@ p.add_args(
     ('--opath', p.STR),
     ('--mpath', p.STR),('--prepath', p.STR),('--continue_training', p.STORE_TRUE), ('--batchsize', p.INT),
     ('--lr', {'type': float}),
-    ('--num_files', p.INT),('--optim', p.STR),('--model_per_eLink',  p.STORE_TRUE),('--model_per_bit_config',  p.STORE_TRUE),('--biased', p.STORE_TRUE), ('--alloc_geom', p.STR)
-    
+    ('--num_files', p.INT),('--optim', p.STR),('--model_per_eLink',  p.STORE_TRUE),('--model_per_bit_config',  p.STORE_TRUE),('--biased', {'type': float}), ('--alloc_geom', p.STR),('--low_eta_ft', p.STORE_TRUE),('--all_pileup', p.STORE_TRUE)
+     
     
 )
 
@@ -90,7 +90,7 @@ with open('eLink_filts.pkl', 'rb') as f:
     key_df = pickle.load(f)
 
     
-
+ 
 
     
 def get_pams():
@@ -183,13 +183,14 @@ def custom_resample(wafers,c,simE):
     n = len(label)
     print(Counter(label))
     indices = np.expand_dims(np.arange(n),axis = -1)
+    # 10x upsample signal
     over = RandomOverSampler(sampling_strategy=0.1)
-    # fit and apply the transform
     indices_p, label_p = over.fit_resample(indices, label)
-    # summarize class distribution
-    # define undersampling strategy
-    under = RandomUnderSampler(sampling_strategy=0.5)
-    # fit and apply the transform
+    # downsample until 1:2::pilup:signal
+    signal_percent = 1-args.biased
+    ratio = args.biased / signal_percent
+    print(ratio)
+    under = RandomUnderSampler(sampling_strategy=ratio)
     indices_p, label_p = under.fit_resample(indices_p, label_p)
     print(Counter(label_p))
     wafers_p = wafers[indices_p[:,0]]
@@ -198,7 +199,8 @@ def custom_resample(wafers,c,simE):
     return wafers_p, c_p
 
 def get_old_mask(eLinks, df):
-    mask = pd.Series([False] * len(df))  # Initialize a mask with all False values
+    # Initialize a mask with all False values, with the same index as the DataFrame
+    mask = pd.Series([False] * len(df), index=df.index)
     
     for eLink in eLinks:
         if eLink == 5:
@@ -235,7 +237,8 @@ def load_data(nfiles,batchsize,model_info = -1, normalize = True):
 
     files = get_rootfiles(hostid, basepath)[0:nfiles]
 
-
+    os.environ["XRD_REQUESTTIMEOUT"] = "120"
+    os.environ["XRD_REDIRECTTIMEOUT"] = "120"
     #loop over all the files
     for i,file in enumerate(files):
         x = NanoEventsFactory.from_root(file, treepath=tree).events()
@@ -297,17 +300,22 @@ def load_data(nfiles,batchsize,model_info = -1, normalize = True):
             elif args.model_per_bit_config:
                 eLinks_with_bit_alloc = [index for index, value in enumerate(bitsPerOutputLink) if value == bitsPerOutput]
                 eLinks_with_bit_alloc = [b for b in eLinks_with_bit_alloc if b < 6]
+                
                 mask = get_old_mask(eLinks_with_bit_alloc, combined_df)
+#                 print(combined_df)
                 filtered_df = combined_df[mask]
-            
+                filtered_df = filtered_df.copy()
+#                 print(filtered_df)
+                
+                
         print('Size after eLink filtering')
         print(len(filtered_df))
         
         # Process the filtered DataFrame
-        filtered_df['eta'] = filtered_df['eta'] / 3.1
-        filtered_df['v'] = filtered_df['v'] / 12
-        filtered_df['u'] = filtered_df['u'] / 12
-        filtered_df['layer'] = (filtered_df['layer']-1) / 46
+        filtered_df.loc[:,'eta'] = filtered_df['eta'] / 3.1
+        filtered_df.loc[:,'v'] = filtered_df['v'] / 12
+        filtered_df.loc[:,'u'] = filtered_df['u'] / 12
+        filtered_df.loc[:,'layer'] = (filtered_df['layer']-1) / 46
 
         # Convert wafertype to one-hot encoding
         temp = filtered_df['wafertype'].astype(int).to_numpy()
@@ -342,6 +350,8 @@ def load_data(nfiles,batchsize,model_info = -1, normalize = True):
         wafer_energy = filtered_df['wafer_energy'].to_numpy()
         data_list.append([inputs,eta,v,u,wafertype,sumCALQ,layer])
         simE_list.append(wafer_sim_energy)
+        
+         
 
     
     inputs_list = []
@@ -372,7 +382,15 @@ def load_data(nfiles,batchsize,model_info = -1, normalize = True):
     concatenated_simE = np.expand_dims(np.concatenate(simE_list),axis = -1)
     concatenated_cond = np.hstack([concatenated_eta,concatenated_v,concatenated_u, concatenated_wafertype, concatenated_sumCALQ,concatenated_layer])
     
-    events = int(np.min([len(inputs), 10000000]))
+    if args.low_eta_ft:
+        print(f'Data before eta fine tuning:{len(concatenated_cond)}')
+        mask = (concatenated_eta < 2.1/3.1)[:,0]
+        print(mask)
+        concatenated_cond = concatenated_cond[mask]
+        concatenated_inputs = concatenated_inputs[mask]
+        print(f'Data after eta fine tuning:{len(concatenated_cond)}')
+        
+    events = int(np.min([len(concatenated_cond), 10000000]))
     indices = np.random.permutation(events)
     # Calculate 80% of n
     num_selected = int(0.8 * events)
@@ -392,8 +410,14 @@ def load_data(nfiles,batchsize,model_info = -1, normalize = True):
         wafer_train,cond_train = custom_resample(wafer_train,cond_train,simE_train)
         print(wafer_train.shape)
         wafer_test,cond_test = custom_resample(wafer_test,cond_test, simE_test)
-        
-
+    if args.all_pileup:
+        mask_train = (simE_train[:,0] == 0)
+        mask_test = (simE_test[:,0] == 0)
+        print(len(cond_train))
+        wafer_train,cond_train = wafer_train[mask_train],cond_train[mask_train]
+        wafer_test,cond_test = wafer_test[mask_test],cond_test[mask_test]
+        print(len(cond_train))
+    
     # Create the training dataset
     train_dataset = tf.data.Dataset.from_tensor_slices((wafer_train,cond_train)
     )
@@ -433,6 +457,8 @@ class keras_floor(Layer):
     
 args = p.parse_args()
 model_dir = args.opath
+
+
 if not os.path.exists(model_dir):
     os.system("mkdir -p "+model_dir)
 
@@ -444,7 +470,10 @@ if args.model_per_eLink:
     elif args.alloc_geom =='new':
         all_models = [1,2,3,4,5,6,7,8,9,10,11]
 elif args.model_per_bit_config:
-    all_models = [1,3,5,7,9]
+    if args.alloc_geom == 'old':
+        all_models = [3,5,7,9]
+    elif args.alloc_geom =='new':
+        all_models = [1,3,5,7,9]
 
 
 bitsPerOutputLink = [0, 1, 3, 5, 7, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]    
@@ -583,13 +612,11 @@ for m in all_models:
 
     # Loading Model
     if args.continue_training:
+        
+        cae.load_weights(os.path.join(model_dir, 'best-epoch.tf'))
+        start_epoch = 1
+        print(f"Continuing training from best model...")
 
-        cae.load_weights(args.mpath)
-        start_epoch = int(args.mpath.split("/")[-1].split(".")[-2].split("-")[-1]) + 1
-        print(f"Continuing training from epoch {start_epoch}...")
-    elif args.mpath:
-        cae.load_weights(args.mpath)
-        print('loaded model')
 
 
 
@@ -607,9 +634,9 @@ for m in all_models:
 
 
     if args.continue_training:
-        cut_path = args.mpath.rsplit('/', 2)[0] + '/'
-        loss_dict = {'train_loss': pd.read_csv(os.path.join(cut_path,'loss.csv'))['train_loss'].tolist(), 
-     'val_loss': pd.read_csv(os.path.join(cut_path,'loss.csv'))['val_loss'].tolist()}
+        loss_dict = {'train_loss': pd.read_csv(os.path.join(model_dir,'df.csv'))['train_loss'].tolist(), 
+     'val_loss': pd.read_csv(os.path.join(model_dir,'df.csv'))['val_loss'].tolist()}
+        start_epoch = 1
     else:
         start_epoch = 1
         loss_dict = {'train_loss': [], 'val_loss': []}
@@ -640,7 +667,7 @@ for m in all_models:
 
         total_loss_train = total_loss_train /(len(train_loader))
         total_loss_val = total_loss_val /(len(test_loader))
-        if epoch % 25 == 0:
+        if epoch % 5 == 0:
             print('Epoch {:03d}, Loss: {:.8f}, ValLoss: {:.8f}'.format(
                 epoch, total_loss_train,  total_loss_val))
 
