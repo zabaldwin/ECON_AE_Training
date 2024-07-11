@@ -60,6 +60,17 @@ To train the model:
 python train_CAE_simon_data.py --mname AE  --batchsize 4000 --lr 1e-4 --nepochs 1000 --opath Tele_CAE_biased_90 --optim lion --loss tele --biased --b_percent 0.90
 ```
 
+Update training w/ configurable pileup percentage in dataset:
+
+```shell 
+python train_CAE_simon_data.py --mname vanilla_AE  --batchsize 4000 --lr 3e-4 --nepochs 500 --opath search_pileup_10 --optim lion --loss tele --alloc_geom old --model_per_bit --num_files 100 --biased 0.1
+```
+
+
+
+
+
+
 To process the model:
 
 ```shell
